@@ -1,0 +1,49 @@
+name: audience-estimation
+
+services:
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: ccdev
+      POSTGRES_PASSWORD: ccdev
+      POSTGRES_DB: ccdev
+    # The fictional dataset is tiny; tmpfs keeps the container disposable.
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ccdev -d ccdev"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "55432:5432"
+
+  api:
+    build:
+      context: .
+      args:
+        PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+    environment:
+      AUDIENCE_DATABASE_URL: postgresql://ccdev:ccdev@db:5432/ccdev
+      AUDIENCE_DB_SCHEMA: audience
+      AUDIENCE_SERVICE_TZ: Asia/Shanghai
+      AUDIENCE_ADMIN_API_KEY: dev-admin-key
+      AUDIENCE_ANALYST_API_KEY: dev-analyst-key
+      AUDIENCE_SEED_ON_START: "1"
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  demo:
+    build:
+      context: .
+    profiles: ["demo"]
+    environment:
+      AUDIENCE_DATABASE_URL: postgresql://ccdev:ccdev@db:5432/ccdev
+      AUDIENCE_SEED_ON_START: "0"
+    depends_on:
+      api:
+        condition: service_healthy
+    command: ["python", "demo/run_demo.py", "--base-url", "http://api:8000"]
