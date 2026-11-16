@@ -3,12 +3,16 @@
 由**虚构**的入户招募资料与个人收听日记，计算可复算的节目收听人数（reach）与人均收听时长，并在
 报告中明确指出**哪些目标群体覆盖不足**，同时**拒绝**用这些数字比较两档节目的表现。
 
+在此之上，服务还提供**推广方案组合触达分析**：以同一调查期、同一权重版本的个人日记为基础，
+对任意节目集合计算联合触达、仅听、交叉、缺访上下界与边际贡献，并在预算、必选节目与互斥时段
+约束下做边际重算选品——方案的价值是**新增听众**，而不是单档加权人数的相加。
+
 不接入真实人口库、真实收听设备或任何真实个人数据。数据集见 `demo/fixtures.py`，全部为构造值。
 
 - 技术栈：Python 3.12 / FastAPI / PostgreSQL 18 / psycopg 3（无 ORM，显式 SQL）
 - 项目类型：**后端服务**，因此提供 OpenAPI 3.x 与 Swagger UI：
   - Swagger UI: `http://127.0.0.1:8000/docs`
-  - OpenAPI JSON: `http://127.0.0.1:8000/openapi.json`（OpenAPI 3.1.0，27 条路径）
+  - OpenAPI JSON: `http://127.0.0.1:8000/openapi.json`（OpenAPI 3.1.0，37 条路径）
 
 ---
 
@@ -161,6 +165,45 @@ export AUDIENCE_ANALYST_API_KEY=dev-analyst-key
 
 理由：每档节目的估计建立在不同的、覆盖不完整的子总体上，跨节目差值会把覆盖差异误读成节目表现差异。
 
+### 4.9 推广方案组合触达（plan task）
+
+**推广方案的价值在于新增听众，而非单档加权人数的相加。** plan task 把"同一调查期、同一权重版本"
+冻结成一次任务，然后在其上对任意节目集合做试算：
+
+- **权重版本**：任务创建时锁定四个输入批次（招募 / 目标 / 节目 / 日记截止），按任务的纳入规则
+  构建样本并做**一次**有界 raking 校准（与 run 相同的算法与限幅），得到该任务的权重版本
+  （`weight_version=1`）。此后该任务内的所有集合试算都复用这同一份权重。
+- **样本纳入规则（与 run 不同）**：只要某人**至少一个候选节目可判定**（相关时段完整覆盖或已确认
+  收听），就进入加权样本。run 的 `full_coverage` 会把部分缺访的人整人排除；plan task 保留他们，
+  因为排除会把"没填"偷偷变成"没听"。完全不可判定的人（如整本日记未交）不进入样本、不携带权重，
+  仅在 `/persons` 中列示。
+- **相关时段未完整覆盖的人不能被放进未触达**：对每个节目，若其播出时段（裁剪到调查期内）未被人
+  的日记完整覆盖（含未解决冲突的 unknown 分钟），该人对该节目为 `unknown`。集合指标中：
+  - `union_reach.lower` = 确认触达的加权和（下界）；
+  - `union_reach.upper` = 确认触达 + 缺访权重（上界，假设缺访者全部收听）；
+  - `union_reach.not_reached` = 完整覆盖且未达阈值的加权和——**缺访者绝不计入未触达**；
+  - 仅听（`exclusive_listen`）、交叉（`crossover`，含两两 `pairwise`）同样给出 `[lower, upper]`；
+  - `intersections` 支持**任意阶**交集查询，按需精确计算——不依赖预先物化的交叉表，也不截断高阶交集。
+- **边际贡献**：`marginal_candidates` 对集合给出加入某档后的边际区间
+  `[确定新增, 可能新增]`。确定新增 = 对集合确认未触达且对该档确认触达；可能新增把缺访者计入，
+  但绝不用猜测填补。
+- **两条计算路径，结果完全一致**：
+  - `scan`：逐人扫描节目集合并加权去重，表达直接，`include_persons=true` 可解释到个人；
+  - `bitmap`：为每档维护按个人索引的压缩位图（Python 大整数位图，未置位区域不占对象），临时组合
+    以位图并集再汇总权重。组合仍是精确的（集合并交，不是近似）。代价是索引构建、权重修订失效
+    （rebind 后旧代际位图标记 `stale`）与内存管理（`/index` 展示各代际状态与内存估计）。
+  - `engine=auto`（默认）按候选池大小选择（> `bitmap_program_threshold`，默认 12，用 bitmap）；
+    单次试算可用 `engine` 覆盖。测试断言两条路径对同一集合返回**逐位相同**的结果。
+- **预算、必选与互斥时段进入同一次边际重算**：优化作业以贪心执行——每一轮对全部剩余候选重算
+  边际确认触达（下界），必选节目先行入集并占用预算，互斥组（不可同时购买的时段）在选中一项后
+  立即封锁同组其余项，预算装不下的候选同轮标注 `cost_exceeds_remaining_budget`。每一轮都记录
+  全部候选的边际、得分与排除原因（选择理由可审计）。优化目标是**确认触达（下界）**；缺访带来的
+  不确定性只以区间呈现，不参与排序。
+- **调查期切换或权重更新时旧任务不得写回**：`POST /rebind` 用新输入重建任务并把
+  `weight_version` 加一；优化作业创建时快照版本号，执行（`POST .../execute`）时在行锁下重新核对，
+  版本不符即标记 `stale_rejected` 并返回 `409 plan_job_stale`，**不写回任何结果**；rebind 也会
+  主动把排队的旧作业标记为 `stale_rejected`，旧位图索引同时失效（`stale`）。
+
 ---
 
 ## 5. 验证方式（以下均为实际执行过的验证）
@@ -172,8 +215,8 @@ export AUDIENCE_TEST_DATABASE_URL=postgresql://ccdev:ccdev@127.0.0.1:5432/ccdev
 .venv/bin/python -m pytest tests/ -q
 ```
 
-实测结果：**53 passed**（`tests/test_core.py` 18 项纯算法测试；`tests/test_api.py` 35 项接口集成测试，
-使用独立随机 schema，结束后自动清理）。
+实测结果：**83 passed**（`tests/test_core.py` 18 项纯算法测试；`tests/test_api.py` 35 项接口集成测试；
+`tests/test_plan.py` 30 项组合触达测试，均使用独立随机 schema，结束后自动清理）。
 
 覆盖的断言包括：
 
@@ -188,6 +231,25 @@ export AUDIENCE_TEST_DATABASE_URL=postgresql://ccdev:ccdev@127.0.0.1:5432/ccdev
 - 未知入样概率、跨节目比较、空单元、限幅失败均按预期拒绝或标记；
 - **按日记份数直接平均会高估青年节目**：实测 `youth_drive` 未加权均值 80.00 分钟，校准加权后 46.70 分钟（1.71 倍）；
   偏老节目方向相反（`midnight_news` 5.23 → 7.22），说明偏差并非常数。
+
+组合触达（plan task）的断言包括：
+
+- 状态分类：确认分钟达阈值 = `reached`；未达阈值但相关时段完整覆盖 = `not_reached`；否则 `unknown`；
+- 缺访者只进入上界，**绝不**计入 `not_reached`；`lower + unknown + not_reached = 样本总权重`；
+- 仅听 / 交叉（含两两）/ 任意阶交集均给出精确 `[lower, upper]`，高阶交集不截断；
+- 边际贡献区分"确定新增"与"可能新增"（缺访只进入后者）；
+- **scan 与 bitmap 两条路径**对同一集合（含边际与交集）返回完全一致的结果；
+- 贪心优化：预算装不下的候选、互斥组被封锁的候选都在同一轮边际重算中标注原因；
+  必选节目先行入集；`must_include` 互相冲突或超预算直接 422；
+- **高重叠样例**：`morning_block` 的观众完全落在 `youth_drive` 内——联合触达 = `youth_drive` 单档，
+  单档相加 ≈ 2 倍联合触达，`morning_block` 的确定边际 = 0；
+- **高边际样例**：`midnight_news` 与 `youth_drive` 观众几乎不相交——边际上界 = 其自身全部触达；
+- **缺访界限样例**：45-64 岁中第 2 天 04:00-20:00 未填的人对白天节目为 `unknown`（上下界分离），
+  对 `midnight_news` 完全可判定（上下界重合为点）；
+- **冲突时段样例**：互斥组 `[youth_drive, morning_block]`、`[afternoon_talk, evening_talk]`
+  在优化结果中绝不同时出现，被封锁项在轮次日志中记为 `exclusive_conflict`；
+- **旧任务不得写回**：rebind 后旧版本排队作业执行返回 `409 plan_job_stale` 且结果为空，
+  旧位图索引标记 `stale`；权重更新（迟到日记）后新试算使用新版本，旧试算仍按原版本可查。
 
 ### 5.2 完整演示脚本
 
@@ -213,7 +275,17 @@ export AUDIENCE_TEST_DATABASE_URL=postgresql://ccdev:ccdev@127.0.0.1:5432/ccdev
 12. 限幅不可达目标 → `rejected` + `unreachable_cells` + 残差；
 13. 空样本抽样层 `rural-remote` → `strata_without_eligible_sample` 列出，无任何合成样本；
 14. 未知入样概率 → `422` 且列出具体人；
-15. 迟到日记 → 新运行发布，旧报告哈希完全不变。
+15. 迟到日记 → 新运行发布，旧报告哈希完全不变；
+16. **组合触达演示**（第 11 段，使用 6 节目的 `plan-schedule-v1` 批次）：
+    - 高重叠：`youth_drive` 单档 2409.46，并入 `morning_block` 后联合触达仍为 2409.46，
+      而单档相加 4818.92；`morning_block` 的确定边际 = 0；
+    - 高边际：`midnight_news` 对 `{youth_drive}` 的边际 = [1325.08, 1982.48]（其上界 = 自身全部触达）；
+    - 缺访界限：`youth_drive` 触达区间 [2409.46, 3066.86]（缺访 6 人、657.40 权重），
+      `midnight_news` 区间退化为点 [1982.48, 1982.48]；
+    - 引擎一致：scan 与 bitmap 对同一集合均返回 6642.34（逐字段相同）；
+    - 优化：预算 100 下贪心依次选 `evening_talk`(20) → `drive_extended`(25) → `midnight_news`(40)，
+      每轮记录全部候选的边际与排除原因（`afternoon_talk` 因互斥被封锁，末轮预算耗尽）；
+    - 权重更新：rebind 后 `weight_version=2`，旧版本排队作业执行返回 `409 plan_job_stale`。
 
 ### 5.3 手工最小验证
 
@@ -234,7 +306,27 @@ curl -s -H "$KEY" localhost:8000/v1/runs/$RID/report
 ```
 
 已实际执行上式（本地端口 8000 换成当时端口）：运行状态 `published`，报告含三档节目，
-`/docs` 返回 200，`/openapi.json` 为 OpenAPI `3.1.0`，共 27 条路径。
+`/docs` 返回 200，`/openapi.json` 为 OpenAPI `3.1.0`，共 37 条路径。
+
+组合触达的最小验证（已实际执行）：
+
+```bash
+CUT=$(curl -s -H "$KEY" localhost:8000/v1/diary/cutoff | python3 -c \
+  "import sys,json;print(json.load(sys.stdin)['available_max_submission_seq'])")
+# 创建 plan task（6 节目批次，seed 写入的第二个节目批次 program_batch_seq=2）
+TID=$(curl -s -H "$KEY" -H 'Content-Type: application/json' -X POST localhost:8000/v1/plan/tasks \
+  -d "{\"inputs\":{\"recruitment_batch_seq\":1,\"target_batch_seq\":1,\"program_batch_seq\":2,\"diary_seq_cutoff\":$CUT}}" \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['task']['task_id'])")
+# 高重叠：联合触达 = youth_drive 单档（2409.46），而非两档相加（4818.92）
+curl -s -H "$KEY" -H 'Content-Type: application/json' -X POST localhost:8000/v1/plan/tasks/$TID/evaluations \
+  -d '{"set":["youth_drive","morning_block"]}'
+# 预算 + 互斥时段的优化作业（两阶段：创建 → 执行）
+JID=$(curl -s -H "$KEY" -H 'Content-Type: application/json' -X POST localhost:8000/v1/plan/tasks/$TID/optimizations \
+  -d '{"budget":100,"costs":{"youth_drive":45,"morning_block":30,"drive_extended":25,"afternoon_talk":35,"evening_talk":20,"midnight_news":40},"exclusive_groups":[["youth_drive","morning_block"],["afternoon_talk","evening_talk"]]}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['job']['job_id'])")
+curl -s -H "$KEY" -X POST localhost:8000/v1/plan/tasks/$TID/optimizations/$JID/execute
+# 实测：选中 ['evening_talk','drive_extended','midnight_news']，成本 85 ≤ 100，联合触达 6642.34
+```
 
 ### 5.4 关于 Docker 的说明
 
@@ -247,7 +339,7 @@ curl -s -H "$KEY" localhost:8000/v1/runs/$RID/report
 
 ## 6. 接口一览
 
-OpenAPI 3.1.0 共 **27 条路径**（同路径的 GET / POST 在表内合并为一行）。完整可交互文档见 `/docs`。
+OpenAPI 3.1.0 共 **37 条路径**（同路径的 GET / POST 在表内合并为一行）。完整可交互文档见 `/docs`。
 
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
@@ -274,6 +366,13 @@ OpenAPI 3.1.0 共 **27 条路径**（同路径的 GET / POST 在表内合并为�
 | POST | `/v1/conflicts/resolutions` | 分析员确认冲突（只影响**新运行**） |
 | GET | `/v1/runs/{id}/coverage-gaps` | 覆盖不足群体 |
 | GET | `/v1/runs/{id}/days`、`/v1/runs/{id}/persons` | 每日分类明细、人员权重与排除 |
+| POST/GET | `/v1/plan/tasks`、`/v1/plan/tasks/{id}` | 创建 / 查看组合触达任务（锁定调查期与权重版本） |
+| POST | `/v1/plan/tasks/{id}/rebind` | 调查期切换 / 权重更新：`weight_version` 加一，旧作业与旧位图失效 |
+| GET | `/v1/plan/tasks/{id}/persons` | 任务样本与权重（含未入样原因） |
+| GET | `/v1/plan/tasks/{id}/index` | 位图索引各代际状态、内存估计、每档置位人数 |
+| POST/GET | `/v1/plan/tasks/{id}/evaluations`、`/evaluations/{eid}` | 任意节目集合试算（联合触达 / 仅听 / 交叉 / 缺访上下界 / 边际）与历史 |
+| POST/GET | `/v1/plan/tasks/{id}/optimizations`、`/optimizations/{jid}` | 预算 + 必选 + 互斥的优化作业（创建时快照版本） |
+| POST | `/v1/plan/tasks/{id}/optimizations/{jid}/execute` | 执行作业：版本核对 → 边际重算 → 写回；过期作业 `409` 拒绝 |
 
 ### 从一个节目数字追溯回去
 
@@ -306,6 +405,7 @@ app/
   timeutil.py        半开区间运算、时区、调查日与节目时段
   analysis.py        样本构建、日记重建、冲突裁决、节目暴露
   runs.py            运行编排：校验→样本→暴露→校准→bootstrap→估计→发布
+  plan.py            组合触达任务编排：建版→校准→位图→试算/优化→rebind 失效
   report.py          报告组装（覆盖不足、缺口、限制）
   lineage.py         单个数字的血缘追溯
   differences.py     组内差值区间；跨节目比较的明确拒绝
@@ -313,11 +413,12 @@ app/
     diary.py         日记重建与四分类日核算
     raking.py        有界 raking 与失败状态
     estimate.py      估计量、家庭分层 bootstrap、百分位区间
+    reach.py         组合触达：scan/bitmap 双路径、缺访上下界、边际、贪心选品
 demo/
-  fixtures.py        虚构家庭 / 个人 / 节目 / 目标 / 日记（含全部边界场景）
-  run_demo.py        端到端演示脚本
+  fixtures.py        虚构家庭 / 个人 / 节目 / 目标 / 日记（含全部边界场景与 6 节目组合批次）
+  run_demo.py        端到端演示脚本（含第 11 段组合触达演示）
 scripts/seed.py      幂等种子写入
-tests/               53 项单元 + 集成测试
+tests/               83 项单元 + 集成测试
 docker/              entrypoint
 Dockerfile, docker-compose.yml, requirements.txt, pytest.ini
 ```
@@ -330,4 +431,8 @@ Dockerfile, docker-compose.yml, requirements.txt, pytest.ini
 - bootstrap 副本数与 `reach_minutes` 阈值可配置；区间宽度随副本数与样本量变化。
 - 日记日固定为当地日历日（`00:00→24:00`）；若改用广播日，需要新的 `diary_window` 约定并重跑。
 - 分析员确认冲突时点会影响后续运行结果，但**不会**改写已发布报告。
+- plan task 的试算与优化是**点估计 + 缺访区间**：抽样不确定性（bootstrap 区间）目前只在 run 的
+  单节目估计中给出，组合触达暂未传播该误差；优化排序因此只使用确认触达下界。
+- plan task 的位图索引随任务版本持久化在数据库中；样本规模极大时，构建耗时与存储随
+  `人数 × 节目数` 增长（`/index` 的 `memory_bytes` 可观测）。
 - Docker 配置未在本次环境实际运行（该环境没有 Docker），见 5.4。

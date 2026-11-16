@@ -196,3 +196,85 @@ class RunCreateIn(Strict):
 
 class ExecuteIn(Strict):
     max_steps: Annotated[int, Field(ge=1, le=100)] = 20
+
+
+# ---------------------------------------------------------------------------
+# Promotion-plan combination reach tasks
+# ---------------------------------------------------------------------------
+class PlanConfigIn(Strict):
+    timezone: str | None = Field(default=None, description="Must match the program batch timezone.")
+    raking: RakingIn = Field(default_factory=RakingIn)
+    reach_minutes: float = Field(
+        default=5.0, gt=0, description="Confirmed minutes needed before a person counts as reached."
+    )
+    engine: Literal["auto", "scan", "bitmap"] = Field(
+        default="auto",
+        description=(
+            "scan: per-person set membership with weight dedup. bitmap: per-program compressed "
+            "bitmaps indexed by person; set union is a bitmap OR. auto picks bitmap when the "
+            "candidate pool exceeds bitmap_program_threshold."
+        ),
+    )
+    bitmap_program_threshold: int = Field(default=12, ge=1, le=100000)
+
+
+class PlanTaskCreateIn(Strict):
+    note: str | None = None
+    inputs: RunInputsIn
+    candidate_programs: list[str] | None = Field(
+        default=None, description="Defaults to every program in the pinned program batch."
+    )
+    config: PlanConfigIn = Field(default_factory=PlanConfigIn)
+
+
+class PlanRebindIn(Strict):
+    """Switch survey period and/or refresh weights. Increments weight_version."""
+
+    inputs: RunInputsIn
+    candidate_programs: list[str] | None = Field(default=None, description="Omit to keep the current pool.")
+    config: PlanConfigIn | None = Field(default=None, description="Omit to keep the current config.")
+    note: str | None = None
+
+
+class PlanEvaluateIn(Strict):
+    set: list[str] = Field(min_length=1, description="Programs evaluated as one combined plan.")
+    engine: Literal["scan", "bitmap"] | None = Field(
+        default=None, description="Override the task engine for this evaluation only."
+    )
+    marginal_candidates: list[str] = Field(
+        default_factory=list,
+        description="Programs whose marginal contribution over `set` is computed.",
+    )
+    intersections: list[list[str]] = Field(
+        default_factory=list,
+        description="Explicit intersection queries of any order (>=2 programs); computed exactly, never truncated.",
+    )
+    include_persons: bool = Field(
+        default=False, description="Include the per-person breakdown (scan path stays explainable to individuals)."
+    )
+
+
+class PlanOptimizeIn(Strict):
+    budget: float = Field(gt=0)
+    costs: dict[str, float] = Field(
+        min_length=1, description="program_key -> positive cost for one purchase."
+    )
+    must_include: list[str] = Field(
+        default_factory=list, description="Programs locked into the plan; their cost counts against the budget."
+    )
+    exclusive_groups: list[list[str]] = Field(
+        default_factory=list,
+        description="Groups of programs that cannot be bought together (e.g. the same airtime slot).",
+    )
+    score: Literal["marginal_per_cost", "marginal"] = "marginal_per_cost"
+
+    @model_validator(mode="after")
+    def _check_groups(self):
+        for group in self.exclusive_groups:
+            if len(group) < 2:
+                raise ValueError("an exclusive group needs at least two programs")
+            if len(set(group)) != len(group):
+                raise ValueError("an exclusive group contains duplicate programs")
+        if len(set(self.must_include)) != len(self.must_include):
+            raise ValueError("must_include contains duplicate programs")
+        return self

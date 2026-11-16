@@ -375,3 +375,114 @@ DROP TRIGGER IF EXISTS run_reports_no_update ON run_reports;
 CREATE TRIGGER run_reports_no_update
     BEFORE UPDATE OR DELETE ON run_reports
     FOR EACH ROW EXECUTE FUNCTION forbid_report_mutation();
+
+-- ---------------------------------------------------------------------------
+-- Promotion-plan combination reach tasks. A plan task pins one survey period
+-- and one weight version (its own calibration over the plan sample), then
+-- evaluates arbitrary program sets on top of it. ``weight_version`` increments
+-- on every rebind (survey-period switch or weight update); jobs created under
+-- an older version are refused when they try to write back.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS plan_tasks (
+    task_id            UUID PRIMARY KEY,
+    status             TEXT NOT NULL,
+    engine             TEXT NOT NULL,            -- resolved engine: scan | bitmap
+    weight_version     INTEGER NOT NULL DEFAULT 1,
+    inputs             JSONB NOT NULL,           -- pinned batch serials
+    candidate_programs JSONB NOT NULL,           -- program keys eligible for sets
+    survey_period      JSONB NOT NULL,
+    config             JSONB NOT NULL,
+    input_hash         TEXT NOT NULL,
+    calibration        JSONB,
+    sample_summary     JSONB,
+    note               TEXT,
+    created_by         TEXT NOT NULL,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (status IN ('calibrated','rejected'))
+);
+
+CREATE TABLE IF NOT EXISTS plan_task_persons (
+    task_id          UUID NOT NULL REFERENCES plan_tasks(task_id),
+    weight_version   INTEGER NOT NULL,
+    person_id        TEXT NOT NULL,
+    household_id     TEXT NOT NULL,
+    strata_effective TEXT NOT NULL,
+    age_band         TEXT NOT NULL,
+    region           TEXT NOT NULL,
+    sex              TEXT NOT NULL,
+    base_weight      NUMERIC(20,8),
+    final_weight     NUMERIC(20,8),
+    in_sample        BOOLEAN NOT NULL,
+    exclusion_code   TEXT,
+    exclusion_detail JSONB,
+    PRIMARY KEY (task_id, weight_version, person_id)
+);
+
+CREATE TABLE IF NOT EXISTS plan_task_person_program (
+    task_id           UUID NOT NULL REFERENCES plan_tasks(task_id),
+    weight_version    INTEGER NOT NULL,
+    person_id         TEXT NOT NULL,
+    program_key       TEXT NOT NULL,
+    confirmed_minutes NUMERIC(14,3) NOT NULL,
+    covered           BOOLEAN NOT NULL,
+    status            TEXT NOT NULL,  -- reached | not_reached | unknown
+    PRIMARY KEY (task_id, weight_version, person_id, program_key)
+);
+
+-- Bitmap index metadata: one row per built index generation. The ordered
+-- person universe is stored so persisted bitmaps can be reloaded exactly.
+CREATE TABLE IF NOT EXISTS plan_task_indexes (
+    task_id        UUID NOT NULL REFERENCES plan_tasks(task_id),
+    weight_version INTEGER NOT NULL,
+    person_ids     JSONB NOT NULL,
+    person_count   INTEGER NOT NULL,
+    program_count  INTEGER NOT NULL,
+    memory_bytes   INTEGER NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'built',
+    built_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (task_id, weight_version),
+    CHECK (status IN ('built','stale'))
+);
+
+CREATE TABLE IF NOT EXISTS plan_task_program_bits (
+    task_id         UUID NOT NULL REFERENCES plan_tasks(task_id),
+    weight_version  INTEGER NOT NULL,
+    program_key     TEXT NOT NULL,
+    reached_bits    TEXT NOT NULL,   -- decimal big-int bitmap over the index universe
+    unknown_bits    TEXT NOT NULL,
+    reached_persons INTEGER NOT NULL,
+    unknown_persons INTEGER NOT NULL,
+    PRIMARY KEY (task_id, weight_version, program_key)
+);
+
+CREATE TABLE IF NOT EXISTS plan_evaluations (
+    eval_id        UUID PRIMARY KEY,
+    task_id        UUID NOT NULL REFERENCES plan_tasks(task_id),
+    weight_version INTEGER NOT NULL,
+    engine         TEXT NOT NULL,
+    request        JSONB NOT NULL,
+    result         JSONB NOT NULL,
+    created_by     TEXT NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS plan_evaluations_task_idx ON plan_evaluations (task_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS plan_jobs (
+    job_id                  UUID PRIMARY KEY,
+    task_id                 UUID NOT NULL REFERENCES plan_tasks(task_id),
+    kind                    TEXT NOT NULL DEFAULT 'optimize',
+    status                  TEXT NOT NULL,
+    weight_version_snapshot INTEGER NOT NULL,
+    input_hash_snapshot     TEXT NOT NULL,
+    request                 JSONB NOT NULL,
+    result                  JSONB,
+    stale_reason            JSONB,
+    created_by              TEXT NOT NULL,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at             TIMESTAMPTZ,
+    CHECK (status IN ('queued','done','stale_rejected','failed'))
+);
+
+CREATE INDEX IF NOT EXISTS plan_jobs_task_idx ON plan_jobs (task_id, created_at DESC);

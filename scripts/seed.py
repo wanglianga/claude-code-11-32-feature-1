@@ -49,11 +49,13 @@ def seed(db: Database, include_unknown_probability: bool = True) -> dict:
     )
     tgt = ingest.create_target_batch(db, fixtures.target_batch(), actor)
     prg = ingest.create_program_batch(db, fixtures.program_batch(), actor)
+    plan_prg = ingest.create_program_batch(db, fixtures.plan_program_batch(), actor)
     return {
         "recruitment_batch_seq": clean["batch_seq"],
         "recruitment_unknown_probability_seq": with_unknown["batch_seq"],
         "target_batch_seq": tgt["batch_seq"],
         "program_batch_seq": prg["batch_seq"],
+        "plan_program_batch_seq": plan_prg["batch_seq"],
     }
 
 

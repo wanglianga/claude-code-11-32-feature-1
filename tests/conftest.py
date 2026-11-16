@@ -100,6 +100,7 @@ def seeded(database, client):
     )
     tgt = ingest.create_target_batch(database, fixtures.target_batch(), "pytest")
     prg = ingest.create_program_batch(database, fixtures.program_batch(), "pytest")
+    plan_prg = ingest.create_program_batch(database, fixtures.plan_program_batch(), "pytest")
     for sub in fixtures.diary_submissions():
         ingest.create_diary_submission(database, sub, "pytest", tz)
     with database.scoped() as conn:
@@ -116,6 +117,7 @@ def seeded(database, client):
         "recruitment_unknown_probability_seq": rec_unknown["batch_seq"],
         "target_batch_seq": tgt["batch_seq"],
         "program_batch_seq": prg["batch_seq"],
+        "plan_program_batch_seq": plan_prg["batch_seq"],
         "cutoff_before_resub": cutoff_before_resub,
         "latest_cutoff": latest,
     }

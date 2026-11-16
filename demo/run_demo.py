@@ -265,6 +265,102 @@ def main() -> int:
             "new_run_cutoff": new_cutoff,
         })
 
+    # ---- 11. promotion-plan combination reach --------------------------------
+    # The seed wrote a second, six-program schedule for plan what-if trials.
+    plan_batch = next((p for p in programs if p["row_count"] >= 18), programs[-1])
+    plan_cutoff = demo.get("/v1/diary/cutoff")["available_max_submission_seq"]
+    plan_inputs = {
+        "recruitment_batch_seq": seeded["recruitment_batch_seq"],
+        "target_batch_seq": seeded["target_batch_seq"],
+        "program_batch_seq": plan_batch["batch_seq"],
+        "diary_seq_cutoff": plan_cutoff,
+    }
+    plan_task = demo.post("/v1/plan/tasks", {"note": "demo-plan", "inputs": plan_inputs})
+    if plan_task:
+        tid = plan_task["task"]["task_id"]
+        show("plan task: one survey period, one weight version, arbitrary sets on top", {
+            "status": plan_task["task"]["status"],
+            "engine": plan_task["engine_resolved"],
+            "weight_version": plan_task["task"]["weight_version"],
+            "candidate_programs": plan_task["task"]["candidate_programs"],
+            "in_sample_persons": plan_task["task"]["sample_summary"]["in_sample_persons"],
+            "inclusion_rule": plan_task["task"]["sample_summary"]["inclusion_rule"],
+        })
+
+        youth = demo.post(f"/v1/plan/tasks/{tid}/evaluations",
+                          {"set": ["youth_drive"], "marginal_candidates": ["morning_block", "midnight_news"]})
+        both = demo.post(f"/v1/plan/tasks/{tid}/evaluations", {"set": ["youth_drive", "morning_block"]})
+        morning = demo.post(f"/v1/plan/tasks/{tid}/evaluations", {"set": ["morning_block"]})
+        show("HIGH OVERLAP: the union dedups people, the naive per-program sum doubles them", {
+            "youth_drive_alone_lower": youth["union_reach"]["lower"],
+            "union_with_morning_block_lower": both["union_reach"]["lower"],
+            "naive_sum_of_the_two_single_counts": round(
+                youth["union_reach"]["lower"] + morning["union_reach"]["lower"], 6),
+            "marginal_of_morning_block_over_youth": youth["marginals"][0],
+        })
+        show("HIGH MARGINAL: midnight_news reaches an almost disjoint audience", {
+            "marginal_of_midnight_news_over_youth": youth["marginals"][1],
+        })
+
+        show("MISSING-DATA BOUNDS: undecidable persons lift the upper bound, never not_reached", {
+            "youth_drive": youth["union_reach"],
+        })
+        midnight = demo.post(f"/v1/plan/tasks/{tid}/evaluations", {"set": ["midnight_news"]})
+        show("fully covered airtime collapses the bounds to a point", midnight["union_reach"])
+
+        scan = demo.post(f"/v1/plan/tasks/{tid}/evaluations",
+                         {"set": ["youth_drive", "afternoon_talk", "midnight_news"], "engine": "scan"})
+        bitmap = demo.post(f"/v1/plan/tasks/{tid}/evaluations",
+                           {"set": ["youth_drive", "afternoon_talk", "midnight_news"], "engine": "bitmap"})
+        show("scan and bitmap engines agree exactly on the same ad-hoc set", {
+            "scan_union": scan["union_reach"],
+            "bitmap_union": bitmap["union_reach"],
+            "identical_results": all(scan[k] == bitmap[k] for k in
+                                     ("union_reach", "exclusive_listen", "crossover")),
+        })
+
+        job = demo.post(f"/v1/plan/tasks/{tid}/optimizations", {
+            "budget": fixtures.PLAN_BUDGET,
+            "costs": fixtures.PLAN_COSTS,
+            "exclusive_groups": fixtures.PLAN_EXCLUSIVE_GROUPS,
+        })
+        done = demo.post(f"/v1/plan/tasks/{tid}/optimizations/{job['job']['job_id']}/execute", {})
+        result = done["job"]["result"]
+        show("OPTIMISATION: budget, must-include and exclusive slots in one marginal recomputation", {
+            "selected": result["selected"],
+            "total_cost": result["total_cost"],
+            "budget": result["budget"],
+            "union_reach": result["union_reach"],
+            "stop_reason": result["stop_reason"],
+            "rounds": [
+                {
+                    "round": r["round"],
+                    "selected": r["selected"],
+                    "reason": r.get("reason"),
+                    "candidates": [
+                        {k: c[k] for k in ("program", "eligible", "excluded_reason",
+                                           "marginal_lower", "score") if k in c}
+                        for c in r["candidates"]
+                    ],
+                }
+                for r in result["rounds"]
+            ],
+        })
+
+        queued = demo.post(f"/v1/plan/tasks/{tid}/optimizations", {
+            "budget": 80.0, "costs": fixtures.PLAN_COSTS,
+            "exclusive_groups": fixtures.PLAN_EXCLUSIVE_GROUPS,
+        })
+        rebind = demo.post(f"/v1/plan/tasks/{tid}/rebind", {"inputs": plan_inputs})
+        stale = demo.client.post(
+            f"/v1/plan/tasks/{tid}/optimizations/{queued['job']['job_id']}/execute")
+        show("WEIGHT UPDATE: a queued job from the old version may not write back", {
+            "rebind_weight_version": rebind["weight_version"],
+            "stale_jobs_rejected_by_rebind": rebind["stale_jobs_rejected"],
+            "execute_http_status": stale.status_code,
+            "error_code": stale.json().get("error", {}).get("code"),
+        })
+
     print("\nALL STEPS COMPLETED")
     return 0
 

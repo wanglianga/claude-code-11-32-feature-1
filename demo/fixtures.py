@@ -569,3 +569,66 @@ def stratum_empty_frame() -> dict:
         if row["person_id"] in {"F007", "F019"}:
             row["stratum"] = "rural-remote"
     return batch
+
+
+# ---------------------------------------------------------------------------
+# Promotion-plan combination reach fixtures.
+#
+# A separate program batch (the base three programs plus three more) designed
+# so the acceptance scenarios are visible in the fictional diary data:
+# * ``morning_block`` sits entirely inside ``youth_drive``'s slot on the same
+#   station, so its audience is a strict subset (extreme overlap: adding it
+#   contributes exactly zero new listeners).
+# * ``drive_extended`` overlaps the tail of ``youth_drive``; nobody listens
+#   past 08:30, so it is also fully absorbed by ``youth_drive``.
+# * ``evening_talk`` likewise sits inside ``afternoon_talk``'s audience.
+# * ``midnight_news`` reaches an almost disjoint (older) audience, so its
+#   marginal contribution over any daytime set is large.
+# * 45-64 diarists with the day-2 gap (04:00-20:00 unfilled) are undecidable
+#   for every daytime program but decidable for ``midnight_news`` — they make
+#   the missing-data [lower, upper] bounds separate for daytime sets.
+# * ``PLAN_EXCLUSIVE_GROUPS`` models slots that cannot be bought together.
+# ---------------------------------------------------------------------------
+PLAN_PROGRAM_SPECS = [
+    ("youth_drive", "Youth Drive", "RADIO-1", "07:00", "08:30"),
+    ("morning_block", "Morning Block", "RADIO-1", "07:30", "08:30"),
+    ("drive_extended", "Drive Extended", "RADIO-1", "08:00", "09:00"),
+    ("afternoon_talk", "Afternoon Talk", "RADIO-3", "14:00", "15:00"),
+    ("evening_talk", "Evening Talk", "RADIO-3", "14:30", "15:30"),
+    ("midnight_news", "Midnight News", "RADIO-2", "23:30", "24:30"),
+]
+
+# Slots that cannot be bought together in one plan.
+PLAN_EXCLUSIVE_GROUPS = [
+    ["youth_drive", "morning_block"],
+    ["afternoon_talk", "evening_talk"],
+]
+
+# One-purchase costs used by the demo budget trial.
+PLAN_COSTS = {
+    "youth_drive": 45.0,
+    "morning_block": 30.0,
+    "drive_extended": 25.0,
+    "afternoon_talk": 35.0,
+    "evening_talk": 20.0,
+    "midnight_news": 40.0,
+}
+PLAN_BUDGET = 100.0
+
+
+def plan_program_batch(batch_ref: str = "plan-schedule-v1") -> dict:
+    """Six-program schedule for combination-reach what-if trials."""
+    airings = []
+    for day in DAYS:
+        for key, title, station, start, end in PLAN_PROGRAM_SPECS:
+            airings.append(
+                {
+                    "program_key": key,
+                    "title": title,
+                    "station": station,
+                    "air_date": day.isoformat(),
+                    "start_local": start,
+                    "end_local": end,
+                }
+            )
+    return {"batch_ref": batch_ref, "timezone": TZ, "airings": airings}

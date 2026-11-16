@@ -10,6 +10,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import ingest
+from . import plan as plan_mod
 from .config import Settings, get_settings
 from .db import Database
 from .errors import ServiceError, conflict, invalid, not_found
@@ -17,6 +18,10 @@ from .jsonutil import loads
 from .models import (
     DiarySubmissionIn,
     ExecuteIn,
+    PlanEvaluateIn,
+    PlanOptimizeIn,
+    PlanRebindIn,
+    PlanTaskCreateIn,
     ProgramBatchIn,
     RecruitmentBatchIn,
     RunCreateIn,
@@ -583,6 +588,222 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
             {**r, "exclusion_detail": loads(r["exclusion_detail"])}
             for r in rows
         ]
+
+    # ---------------- plan tasks (combination reach) ----------------
+    @app.post("/v1/plan/tasks", status_code=201, tags=["plan"])
+    def post_plan_task(body: PlanTaskCreateIn, actor: str = Depends(analyst)):
+        return plan_mod.create_task(db, settings, body.model_dump(mode="json"), actor)
+
+    @app.get("/v1/plan/tasks", tags=["plan"])
+    def list_plan_tasks(actor: str = Depends(analyst), limit: int = Query(default=50, le=500)):
+        with db.scoped() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT task_id, status, engine, weight_version, candidate_programs,
+                       survey_period, input_hash, note, created_by, created_at, updated_at
+                  FROM plan_tasks ORDER BY created_at DESC LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                **{k: v for k, v in r.items() if k not in ("candidate_programs", "survey_period")},
+                "task_id": str(r["task_id"]),
+                "candidate_programs": loads(r["candidate_programs"]),
+                "survey_period": loads(r["survey_period"]),
+                "created_at": iso(r["created_at"]),
+                "updated_at": iso(r["updated_at"]),
+            }
+            for r in rows
+        ]
+
+    @app.get("/v1/plan/tasks/{task_id}", tags=["plan"])
+    def get_plan_task(task_id: str, actor: str = Depends(analyst)):
+        with db.scoped() as conn:
+            return plan_mod.fetch_task(conn.cursor(), task_id)
+
+    @app.post("/v1/plan/tasks/{task_id}/rebind", tags=["plan"])
+    def post_plan_rebind(task_id: str, body: PlanRebindIn, actor: str = Depends(analyst)):
+        return plan_mod.rebind_task(db, task_id, body.model_dump(mode="json"), actor)
+
+    @app.get("/v1/plan/tasks/{task_id}/persons", tags=["plan"])
+    def plan_persons(
+        task_id: str,
+        actor: str = Depends(analyst),
+        in_sample: bool | None = None,
+        limit: int = Query(default=200, le=2000),
+        offset: int = Query(default=0, ge=0),
+    ):
+        with db.scoped() as conn:
+            cur = conn.cursor()
+            task = plan_mod.fetch_task(cur, task_id)
+            clauses = ["task_id=%s", "weight_version=%s"]
+            params: list[Any] = [task_id, task["weight_version"]]
+            if in_sample is not None:
+                clauses.append("in_sample=%s")
+                params.append(in_sample)
+            params.extend([limit, offset])
+            cur.execute(
+                f"""
+                SELECT person_id, household_id, strata_effective, age_band, region, sex,
+                       base_weight, final_weight, in_sample, exclusion_code, exclusion_detail
+                  FROM plan_task_persons WHERE {' AND '.join(clauses)}
+                 ORDER BY person_id LIMIT %s OFFSET %s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+        return {
+            "task_id": task_id,
+            "weight_version": task["weight_version"],
+            "persons": [{**r, "exclusion_detail": loads(r["exclusion_detail"])} for r in rows],
+        }
+
+    @app.get("/v1/plan/tasks/{task_id}/index", tags=["plan"])
+    def plan_index(task_id: str, actor: str = Depends(analyst)):
+        with db.scoped() as conn:
+            cur = conn.cursor()
+            task = plan_mod.fetch_task(cur, task_id)
+            cur.execute(
+                """
+                SELECT weight_version, person_count, program_count, memory_bytes, status, built_at
+                  FROM plan_task_indexes WHERE task_id=%s ORDER BY weight_version DESC
+                """,
+                (task_id,),
+            )
+            generations = [
+                {**r, "built_at": iso(r["built_at"])} for r in cur.fetchall()
+            ]
+            cur.execute(
+                """
+                SELECT program_key, reached_persons, unknown_persons,
+                       LENGTH(reached_bits) AS reached_bits_digits,
+                       LENGTH(unknown_bits) AS unknown_bits_digits
+                  FROM plan_task_program_bits
+                 WHERE task_id=%s AND weight_version=%s ORDER BY program_key
+                """,
+                (task_id, task["weight_version"]),
+            )
+            programs = cur.fetchall()
+        return {
+            "task_id": task_id,
+            "engine": task["engine"],
+            "weight_version": task["weight_version"],
+            "generations": generations,
+            "current_program_bits": programs,
+            "notes": {
+                "invalidation": "a weight update (rebind) marks every older index generation stale; "
+                "bitmap evaluations always run on the index of the current weight version",
+                "memory_bytes": "approximate heap cost of the stored reached/unknown bitmaps",
+            },
+        }
+
+    @app.post("/v1/plan/tasks/{task_id}/evaluations", status_code=201, tags=["plan"])
+    def post_plan_evaluation(task_id: str, body: PlanEvaluateIn, actor: str = Depends(analyst)):
+        return plan_mod.evaluate_task(db, task_id, body.model_dump(mode="json"), actor)
+
+    @app.get("/v1/plan/tasks/{task_id}/evaluations", tags=["plan"])
+    def list_plan_evaluations(
+        task_id: str,
+        actor: str = Depends(analyst),
+        limit: int = Query(default=50, le=500),
+    ):
+        with db.scoped() as conn:
+            cur = conn.cursor()
+            plan_mod.fetch_task(cur, task_id)
+            cur.execute(
+                """
+                SELECT eval_id, weight_version, engine, request, created_by, created_at
+                  FROM plan_evaluations WHERE task_id=%s ORDER BY created_at DESC LIMIT %s
+                """,
+                (task_id, limit),
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                **r,
+                "eval_id": str(r["eval_id"]),
+                "request": loads(r["request"]),
+                "created_at": iso(r["created_at"]),
+            }
+            for r in rows
+        ]
+
+    @app.get("/v1/plan/tasks/{task_id}/evaluations/{eval_id}", tags=["plan"])
+    def get_plan_evaluation(task_id: str, eval_id: str, actor: str = Depends(analyst)):
+        with db.scoped() as conn:
+            cur = conn.cursor()
+            plan_mod.fetch_task(cur, task_id)
+            cur.execute(
+                "SELECT * FROM plan_evaluations WHERE eval_id=%s AND task_id=%s",
+                (eval_id, task_id),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise not_found("plan_evaluation_not_found", "evaluation does not exist for this task")
+            return {
+                "eval_id": str(row["eval_id"]),
+                "task_id": task_id,
+                "weight_version": row["weight_version"],
+                "engine_used": row["engine"],
+                "request": loads(row["request"]),
+                "created_by": row["created_by"],
+                "created_at": iso(row["created_at"]),
+                **loads(row["result"]),
+            }
+
+    @app.post("/v1/plan/tasks/{task_id}/optimizations", status_code=201, tags=["plan"])
+    def post_plan_optimization(task_id: str, body: PlanOptimizeIn, actor: str = Depends(analyst)):
+        return plan_mod.create_optimization(db, task_id, body.model_dump(mode="json"), actor)
+
+    @app.get("/v1/plan/tasks/{task_id}/optimizations", tags=["plan"])
+    def list_plan_optimizations(
+        task_id: str,
+        actor: str = Depends(analyst),
+        limit: int = Query(default=50, le=500),
+    ):
+        with db.scoped() as conn:
+            cur = conn.cursor()
+            plan_mod.fetch_task(cur, task_id)
+            cur.execute(
+                """
+                SELECT job_id, status, weight_version_snapshot, request, stale_reason, created_by, created_at, finished_at
+                  FROM plan_jobs WHERE task_id=%s AND kind='optimize' ORDER BY created_at DESC LIMIT %s
+                """,
+                (task_id, limit),
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                **r,
+                "job_id": str(r["job_id"]),
+                "request": loads(r["request"]),
+                "stale_reason": loads(r["stale_reason"]),
+                "created_at": iso(r["created_at"]),
+                "finished_at": iso(r["finished_at"]),
+            }
+            for r in rows
+        ]
+
+    @app.get("/v1/plan/tasks/{task_id}/optimizations/{job_id}", tags=["plan"])
+    def get_plan_optimization(task_id: str, job_id: str, actor: str = Depends(analyst)):
+        with db.scoped() as conn:
+            cur = conn.cursor()
+            plan_mod.fetch_task(cur, task_id)
+            cur.execute(
+                "SELECT * FROM plan_jobs WHERE job_id=%s AND task_id=%s",
+                (job_id, task_id),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise not_found("plan_job_not_found", "optimisation job does not exist for this task")
+            return {"job": plan_mod.serialize_job(row)}
+
+    @app.post("/v1/plan/tasks/{task_id}/optimizations/{job_id}/execute", tags=["plan"])
+    def post_plan_optimization_execute(task_id: str, job_id: str, actor: str = Depends(analyst)):
+        return plan_mod.execute_optimization(db, task_id, job_id, actor)
 
     return app
 
